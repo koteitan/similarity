@@ -145,10 +145,18 @@ struct Cli {
     /// Exit with code 1 if duplicates are found
     #[arg(long)]
     fail_on_duplicates: bool,
-    
+
     /// Use new generalized structure comparison framework (experimental)
     #[arg(long)]
     use_structure_comparison: bool,
+
+    /// Enable intra-function clone detection (find duplicated code within the same function)
+    #[arg(long = "intra-function")]
+    intra_function: bool,
+
+    /// Minimum occurrences for intra-function clone detection (default: 2)
+    #[arg(long, default_value = "2")]
+    intra_min_occurrences: usize,
 }
 
 fn main() -> anyhow::Result<()> {
@@ -158,12 +166,13 @@ fn main() -> anyhow::Result<()> {
     let types_enabled = (cli.types && !cli.no_types) && !cli.classes_only;
     let classes_enabled = cli.classes || cli.classes_only;
     let overlap_enabled = cli.overlap;
+    let intra_function_enabled = cli.intra_function;
     let unified_types_enabled = cli.unified_types && !cli.no_unified_types;
     let include_type_literals = true; // Always include type literals
 
     // Validate that at least one analyzer is enabled
-    if !functions_enabled && !types_enabled && !classes_enabled && !overlap_enabled {
-        eprintln!("Error: At least one analyzer must be enabled. Remove --no-types to enable type checking, use --classes for class checking, use --overlap for overlap detection, or remove --no-functions.");
+    if !functions_enabled && !types_enabled && !classes_enabled && !overlap_enabled && !intra_function_enabled {
+        eprintln!("Error: At least one analyzer must be enabled. Remove --no-types to enable type checking, use --classes for class checking, use --overlap for overlap detection, use --intra-function for intra-function clone detection, or remove --no-functions.");
         return Err(anyhow::anyhow!("No analyzer enabled"));
     }
 
@@ -258,7 +267,7 @@ fn main() -> anyhow::Result<()> {
     if overlap_enabled {
         println!("=== Overlap Detection ===");
         let overlap_duplicate_count = check_overlaps(
-            cli.paths,
+            cli.paths.clone(),
             cli.threshold,
             cli.extensions.as_ref(),
             cli.print,
@@ -268,6 +277,29 @@ fn main() -> anyhow::Result<()> {
             &cli.exclude,
         )?;
         total_duplicates += overlap_duplicate_count;
+    }
+
+    // Run intra-function clone analysis if enabled
+    if intra_function_enabled
+        && (functions_enabled || types_enabled || classes_enabled || overlap_enabled)
+    {
+        println!("\n{}\n", separator);
+    }
+
+    if intra_function_enabled {
+        println!("=== Intra-function Clone Detection ===");
+        let intra_clone_count = check_intra_function_clones(
+            cli.paths,
+            cli.threshold,
+            cli.extensions.as_ref(),
+            cli.print,
+            cli.overlap_min_window,
+            cli.overlap_max_window,
+            cli.overlap_size_tolerance,
+            cli.intra_min_occurrences,
+            &cli.exclude,
+        )?;
+        total_duplicates += intra_clone_count;
     }
 
     // Exit with code 1 if duplicates found and --fail-on-duplicates is set
@@ -1352,4 +1384,175 @@ fn show_class_comparison_details(result: &similarity_core::ClassComparisonResult
             println!("  {}: {} vs {}", mismatch.name, mismatch.signature1, mismatch.signature2);
         }
     }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn check_intra_function_clones(
+    paths: Vec<String>,
+    threshold: f64,
+    extensions: Option<&Vec<String>>,
+    print: bool,
+    min_window_size: u32,
+    max_window_size: u32,
+    size_tolerance: f64,
+    min_occurrences: usize,
+    exclude_patterns: &[String],
+) -> anyhow::Result<usize> {
+    use ignore::WalkBuilder;
+    use similarity_core::{find_intra_function_clones_across_files, IntraFunctionCloneOptions};
+    use std::collections::{HashMap, HashSet};
+    use std::fs;
+    use std::path::Path;
+
+    let default_extensions = vec!["js", "ts", "jsx", "tsx", "mjs", "mts", "cjs", "cts"];
+    let exts: Vec<&str> =
+        extensions.map_or(default_extensions, |v| v.iter().map(String::as_str).collect());
+
+    let exclude_matcher = create_exclude_matcher(exclude_patterns);
+    let mut files = Vec::new();
+    let mut visited = HashSet::new();
+
+    // Process each path
+    for path_str in &paths {
+        let path = Path::new(path_str);
+
+        if path.is_file() {
+            if let Some(ext) = path.extension() {
+                if let Some(ext_str) = ext.to_str() {
+                    if exts.contains(&ext_str) {
+                        if let Ok(canonical) = path.canonicalize() {
+                            if visited.insert(canonical.clone()) {
+                                files.push(path.to_path_buf());
+                            }
+                        }
+                    }
+                }
+            }
+        } else if path.is_dir() {
+            let walker = WalkBuilder::new(path)
+                .follow_links(false)
+                .git_ignore(true)
+                .git_global(true)
+                .git_exclude(true)
+                .build();
+
+            for entry in walker {
+                let entry = entry?;
+                let entry_path = entry.path();
+
+                if !entry_path.is_file() {
+                    continue;
+                }
+
+                if let Some(ref matcher) = exclude_matcher {
+                    if matcher.is_match(entry_path) {
+                        continue;
+                    }
+
+                    if let Ok(current_dir) = std::env::current_dir() {
+                        if let Ok(relative) = entry_path.strip_prefix(&current_dir) {
+                            if matcher.is_match(relative) {
+                                continue;
+                            }
+                        }
+                    }
+                }
+
+                if let Some(ext) = entry_path.extension() {
+                    if let Some(ext_str) = ext.to_str() {
+                        if exts.contains(&ext_str) {
+                            if let Ok(canonical) = entry_path.canonicalize() {
+                                if visited.insert(canonical.clone()) {
+                                    files.push(entry_path.to_path_buf());
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        } else {
+            eprintln!("Warning: Path not found: {}", path_str);
+        }
+    }
+
+    if files.is_empty() {
+        println!("No JavaScript/TypeScript files found in specified paths");
+        return Ok(0);
+    }
+
+    println!(
+        "Checking {} files for intra-function clones...\n",
+        files.len()
+    );
+
+    // Read all file contents
+    let mut file_contents = HashMap::new();
+    for file in &files {
+        match fs::read_to_string(file) {
+            Ok(content) => {
+                let file_str = file.to_string_lossy().to_string();
+                file_contents.insert(file_str, content);
+            }
+            Err(e) => {
+                eprintln!("Error reading {}: {}", file.display(), e);
+            }
+        }
+    }
+
+    // Set up options
+    let options = IntraFunctionCloneOptions {
+        min_node_count: min_window_size,
+        max_node_count: max_window_size,
+        threshold,
+        size_tolerance,
+        min_occurrences,
+    };
+
+    // Find intra-function clones
+    let clones = find_intra_function_clones_across_files(&file_contents, &options)?;
+
+    if clones.is_empty() {
+        println!("\nNo intra-function clones found!");
+    } else {
+        println!("\nIntra-function clones found:");
+        println!("{}", "-".repeat(60));
+
+        for clone in &clones {
+            let first_loc = &clone.locations[0];
+            let relative_path = get_relative_path(&first_loc.file_path);
+
+            println!(
+                "\nClone group: {} occurrences, {:.2}% similarity, {} nodes ({})",
+                clone.locations.len(),
+                clone.similarity * 100.0,
+                clone.node_count,
+                clone.node_type
+            );
+            println!("Function: {} ({})", first_loc.function_name, relative_path);
+
+            for loc in &clone.locations {
+                println!("  L{}-{}", loc.start_line, loc.end_line);
+            }
+
+            if print {
+                // Show the code for each location
+                if let Some(content) = file_contents.get(&first_loc.file_path) {
+                    println!("\n\x1b[36m--- Duplicated Code ---\x1b[0m");
+                    if let Ok(segment) = extract_code_lines(
+                        content,
+                        first_loc.start_line,
+                        first_loc.end_line,
+                    ) {
+                        println!("{}", segment);
+                    }
+                }
+            }
+
+            println!("\nSuggestion: Extract to helper function");
+        }
+
+        println!("\nTotal clone groups found: {}", clones.len());
+    }
+
+    Ok(clones.len())
 }

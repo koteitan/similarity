@@ -10,6 +10,7 @@ pub mod fast_similarity;
 pub mod function_extractor;
 pub mod generic_overlap_detector;
 pub mod generic_parser_config;
+pub mod intra_function_clones;
 pub mod generic_tree_sitter_parser;
 pub mod language_parser;
 pub mod overlap_detector;
@@ -105,6 +106,12 @@ pub use generic_overlap_detector::{
     find_function_overlaps_generic, find_overlaps_across_files_generic,
     find_overlaps_with_similarity_generic, DetailedOverlap as GenericDetailedOverlap,
     PartialOverlapWithFiles as GenericPartialOverlapWithFiles,
+};
+
+// Intra-function clone detection exports
+pub use intra_function_clones::{
+    detect_intra_function_clones, find_intra_function_clones_across_files,
+    find_intra_function_clones_in_file, CloneGroup, CloneLocation, IntraFunctionCloneOptions,
 };
 
 // Class-related exports
